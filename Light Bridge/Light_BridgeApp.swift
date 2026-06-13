@@ -9,12 +9,14 @@ import SwiftUI
 
 @main
 struct Light_BridgeApp: App {
-    // Using ZhiyunGATTController with proprietary Zhiyun GATT protocol
+    @StateObject private var controller = BluetoothDeviceManager.shared
+    
+    // Using BluetoothDeviceManager with proprietary Zhiyun GATT protocol
     // (Bluetooth Mesh is only for provisioning, not light control)
     
     var body: some Scene {
         WindowGroup {
-            GATTContentView()
+            GATTContentView(controller: controller)
         }
     }
 }

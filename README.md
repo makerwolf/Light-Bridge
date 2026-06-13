@@ -50,6 +50,7 @@ Light Bridge provides seamless connectivity to Bluetooth-controllable studio lig
 
 ### Currently Supported
 - **Zhiyun Bi-Color Lights**: Full support for Zhiyun's bi-color LED lighting systems
+- **Opple Light Master (III/IV)**: BLE discovery and pairing support (measurement parsing in progress)
 
 ### Planned Support
 We're actively working to add support for additional lighting brands and models. Contributions and feature requests are welcome!
@@ -95,7 +96,8 @@ The app is built using SwiftUI and follows a clean architecture pattern:
   - `GATTContentView.swift`: Bluetooth GATT service interface
   
 - **Managers**: Business logic and service controllers
-  - `ZhiyunGATTController.swift`: Handles Bluetooth GATT communication with Zhiyun devices
+  - `BluetoothDeviceManager.swift`: Handles Bluetooth discovery/session flow and Zhiyun light protocol
+  - `OppleGATTController.swift`: Handles Opple Light Master protocol and notifications
   
 - **Models**: Data structures and business entities
 

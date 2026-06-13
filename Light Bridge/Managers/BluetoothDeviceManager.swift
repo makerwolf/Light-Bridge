@@ -61,11 +61,23 @@ struct ZhiyunDeviceState {
     var deviceName: String = ""
     var modelCode: String = ""  // e.g., "PL105"
     var modelName: String = ""  // e.g., "MOLUS X100"
+    var meterCCT: Double?
+    var meterLux: Double?
+    var meterDuv: Double?
+    var meterEV100: Double?
+    var meterBatteryPercent: Int?
+    var meterTemperature: Int?
+    var meterMetricsProfileId: String?
+    var meterMetricsProfileName: String?
+    var meterMetricsProfileIsProvisional: Bool = false
+    var meterUpdatedAt: Date?
 }
 
-// MARK: - ZhiyunGATTController
+// MARK: - BluetoothDeviceManager
 @MainActor
-class ZhiyunGATTController: NSObject, ObservableObject {
+class BluetoothDeviceManager: NSObject, ObservableObject {
+    static let shared = BluetoothDeviceManager()
+    
     // MARK: - Published Properties
     @Published var isScanning = false
     @Published var discoveredDevices: [CBPeripheral] = []
@@ -81,6 +93,12 @@ class ZhiyunGATTController: NSObject, ObservableObject {
     var deviceState: ZhiyunDeviceState {
         get { selectedDeviceId.flatMap { deviceStates[$0] } ?? ZhiyunDeviceState() }
     }
+    var connectedLightDevices: [CBPeripheral] {
+        connectedDevices.filter { deviceProfiles[$0.identifier] == .zhiyunLight }
+    }
+    var connectedMeterDevices: [CBPeripheral] {
+        connectedDevices.filter { deviceProfiles[$0.identifier] == .oppleLightMaster }
+    }
     
     // MARK: - Private Properties
     private var centralManager: CBCentralManager!
@@ -88,6 +106,34 @@ class ZhiyunGATTController: NSObject, ObservableObject {
     private var notifyCharacteristics: [UUID: CBCharacteristic] = [:]  // Per device
     private var sequenceNumbers: [UUID: UInt16] = [:]  // Per device
     private var pendingCommands: [UInt16: (Data) -> Void] = [:]
+    private var deviceProfiles: [UUID: SupportedDeviceProfile] = [:]
+    private var discoveredProfiles: [UUID: SupportedDeviceProfile] = [:]
+    private var loggedUnknownDevices: Set<UUID> = []
+    private var connectingDeviceIds: Set<UUID> = []
+    private lazy var oppleController = OppleGATTController(
+        logMessage: { [weak self] message in
+            self?.log(message)
+        },
+        onMeasurement: { [weak self] deviceId, reading in
+            guard let self else { return }
+            guard self.deviceStates[deviceId] != nil else { return }
+            self.deviceStates[deviceId]?.meterCCT = reading.cctKelvin
+            self.deviceStates[deviceId]?.meterLux = reading.lux
+            self.deviceStates[deviceId]?.meterDuv = reading.duv
+            self.deviceStates[deviceId]?.meterEV100 = reading.ev100
+            self.deviceStates[deviceId]?.meterBatteryPercent = reading.batteryPercent
+            self.deviceStates[deviceId]?.meterTemperature = reading.temperature
+            self.deviceStates[deviceId]?.meterMetricsProfileId = reading.metricsProfileId
+            self.deviceStates[deviceId]?.meterMetricsProfileName = reading.metricsProfileName
+            self.deviceStates[deviceId]?.meterMetricsProfileIsProvisional = reading.metricsProfileIsProvisional
+            self.deviceStates[deviceId]?.meterUpdatedAt = reading.updatedAt
+        },
+        onBatteryLevel: { [weak self] deviceId, batteryPercent in
+            guard let self else { return }
+            guard self.deviceStates[deviceId] != nil else { return }
+            self.deviceStates[deviceId]?.meterBatteryPercent = batteryPercent
+        }
+    )
     
     // Debounce timers per device
     private var brightnessDebounceTask: [UUID: Task<Void, Never>] = [:]
@@ -173,24 +219,28 @@ class ZhiyunGATTController: NSObject, ObservableObject {
     ]
     
     // Auto-connect to known devices
-    private let knownDevicesKey = "knownZhiyunDevices"
+    private let knownDevicesKey = "knownBluetoothDevices"
+    private let legacyKnownDevicesKey = "knownZhiyunDevices"
     
     // MARK: - Initialization
     override init() {
         super.init()
         centralManager = CBCentralManager(delegate: self, queue: nil)
-        log("ZhiyunGATTController initialized")
+        log("BluetoothDeviceManager initialized")
     }
     
     // MARK: - Known Devices Storage
     private var knownDeviceUUIDs: [UUID] {
         get {
-            let strings = UserDefaults.standard.stringArray(forKey: knownDevicesKey) ?? []
-            return strings.compactMap { UUID(uuidString: $0) }
+            let primary = UserDefaults.standard.stringArray(forKey: knownDevicesKey) ?? []
+            let legacy = UserDefaults.standard.stringArray(forKey: legacyKnownDevicesKey) ?? []
+            let merged = Array(Set(primary + legacy))
+            return merged.compactMap { UUID(uuidString: $0) }
         }
         set {
             let strings = newValue.map { $0.uuidString }
             UserDefaults.standard.set(strings, forKey: knownDevicesKey)
+            UserDefaults.standard.removeObject(forKey: legacyKnownDevicesKey)
         }
     }
     
@@ -233,13 +283,18 @@ class ZhiyunGATTController: NSObject, ObservableObject {
             return
         }
         
-        log("Starting scan for Zhiyun devices...")
+        log("Starting scan for supported BLE lights/meters...")
         isScanning = true
+        lastError = nil
         discoveredDevices.removeAll()
+        discoveredProfiles.removeAll()
+        loggedUnknownDevices.removeAll()
         
-        // Scan for devices with the Zhiyun service UUID or by name
+        // Scan all peripherals and filter in didDiscover.
+        // Many BLE devices (including supported lights/meters) do not advertise
+        // service UUIDs consistently, so service-filtered scanning can miss them.
         centralManager.scanForPeripherals(
-            withServices: nil,  // Scan all devices to find by name
+            withServices: nil,
             options: [CBCentralManagerScanOptionAllowDuplicatesKey: false]
         )
     }
@@ -257,6 +312,11 @@ class ZhiyunGATTController: NSObject, ObservableObject {
             log("Already connected to \(peripheral.name ?? "Unknown")")
             return
         }
+        if connectingDeviceIds.contains(peripheral.identifier) {
+            log("Already connecting to \(peripheral.name ?? "Unknown")")
+            return
+        }
+        connectingDeviceIds.insert(peripheral.identifier)
         log("Connecting to \(peripheral.name ?? "Unknown")...")
         centralManager.connect(peripheral, options: nil)
     }
@@ -282,6 +342,11 @@ class ZhiyunGATTController: NSObject, ObservableObject {
     /// Get state for a specific device
     func state(for peripheral: CBPeripheral) -> ZhiyunDeviceState {
         return deviceStates[peripheral.identifier] ?? ZhiyunDeviceState()
+    }
+    
+    /// Device profile for UI routing.
+    func profile(for peripheral: CBPeripheral) -> SupportedDeviceProfile {
+        return deviceProfiles[peripheral.identifier] ?? .zhiyunLight
     }
     
     // MARK: - Command Building
@@ -556,14 +621,16 @@ class ZhiyunGATTController: NSObject, ObservableObject {
     ///   - deviceId: Specific device UUID, or nil
     ///   - allDevices: If true and deviceId is nil, returns ALL connected devices (ignores selectedDeviceId)
     private func getTargetDevices(for deviceId: UUID?, allDevices: Bool = false) -> [CBPeripheral] {
+        let lightDevices = connectedLightDevices
+        
         if let specificId = deviceId {
-            return connectedDevices.filter { $0.identifier == specificId }
+            return lightDevices.filter { $0.identifier == specificId }
         } else if allDevices {
-            return connectedDevices  // All connected devices explicitly requested
+            return lightDevices  // All connected lights explicitly requested
         } else if let selectedId = selectedDeviceId {
-            return connectedDevices.filter { $0.identifier == selectedId }
+            return lightDevices.filter { $0.identifier == selectedId }
         } else {
-            return connectedDevices  // No selection, default to all
+            return lightDevices  // No selection, default to all lights
         }
     }
     
@@ -663,7 +730,7 @@ class ZhiyunGATTController: NSObject, ObservableObject {
 }
 
 // MARK: - CBCentralManagerDelegate
-extension ZhiyunGATTController: CBCentralManagerDelegate {
+extension BluetoothDeviceManager: CBCentralManagerDelegate {
     nonisolated func centralManagerDidUpdateState(_ central: CBCentralManager) {
         Task { @MainActor in
             switch central.state {
@@ -692,30 +759,72 @@ extension ZhiyunGATTController: CBCentralManagerDelegate {
     
     nonisolated func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral, advertisementData: [String: Any], rssi RSSI: NSNumber) {
         Task { @MainActor in
-            // Filter by supported device name prefixes
-            if let name = peripheral.name, self.isSupportedDevice(name) {
-                if !self.discoveredDevices.contains(where: { $0.identifier == peripheral.identifier }) {
-                    self.log("Discovered: \(name)")
-                    self.discoveredDevices.append(peripheral)
-                    
-                    // Auto-connect to all known devices (not just one)
-                    if self.isKnownDevice(peripheral) && !self.connectedDevices.contains(where: { $0.identifier == peripheral.identifier }) {
-                        self.log("Auto-connecting to known device: \(name)")
-                        self.connect(to: peripheral)
-                    }
+            guard let profile = self.resolveProfile(for: peripheral, advertisementData: advertisementData) else {
+                if !self.loggedUnknownDevices.contains(peripheral.identifier) {
+                    self.loggedUnknownDevices.insert(peripheral.identifier)
+                    let discoveredName = self.candidateName(for: peripheral, advertisementData: advertisementData) ?? "Unknown"
+                    let uuids = (advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID] ?? [])
+                        .map(\.uuidString)
+                        .joined(separator: ", ")
+                    //self.log("Ignoring unknown BLE device: \(discoveredName) (RSSI: \(RSSI), services: [\(uuids)])")
+                }
+                return
+            }
+            
+            self.discoveredProfiles[peripheral.identifier] = profile
+            let deviceName = peripheral.name ?? peripheral.identifier.uuidString
+            
+            if !self.discoveredDevices.contains(where: { $0.identifier == peripheral.identifier }) {
+                self.log("Discovered \(profile == .zhiyunLight ? "light" : "meter"): \(deviceName)")
+                self.discoveredDevices.append(peripheral)
+                
+                // Auto-connect to known devices.
+                if self.isKnownDevice(peripheral) && !self.connectedDevices.contains(where: { $0.identifier == peripheral.identifier }) {
+                    self.log("Auto-connecting to known device: \(deviceName)")
+                    self.connect(to: peripheral)
                 }
             }
         }
     }
     
-    /// Check if device name matches any supported Zhiyun device prefix
-    private func isSupportedDevice(_ name: String) -> Bool {
+    /// Check if device name matches any supported Zhiyun device prefix.
+    private func isSupportedZhiyunDevice(_ name: String) -> Bool {
+        let upper = name.uppercased()
         for prefix in supportedPrefixes {
-            if name.hasPrefix(prefix) {
+            if upper.hasPrefix(prefix) {
                 return true
             }
         }
         return false
+    }
+    
+    private func candidateName(for peripheral: CBPeripheral, advertisementData: [String: Any]? = nil) -> String? {
+        if let peripheralName = peripheral.name, !peripheralName.isEmpty {
+            return peripheralName
+        }
+        
+        if let advertised = advertisementData?[CBAdvertisementDataLocalNameKey] as? String, !advertised.isEmpty {
+            return advertised
+        }
+        
+        return nil
+    }
+    
+    private func resolveProfile(for peripheral: CBPeripheral, advertisementData: [String: Any]? = nil) -> SupportedDeviceProfile? {
+        if let known = deviceProfiles[peripheral.identifier] ?? discoveredProfiles[peripheral.identifier] {
+            return known
+        }
+        
+        if let name = candidateName(for: peripheral, advertisementData: advertisementData),
+           isSupportedZhiyunDevice(name) {
+            return .zhiyunLight
+        }
+        
+        if oppleController.canHandle(peripheral: peripheral, advertisementData: advertisementData) {
+            return .oppleLightMaster
+        }
+        
+        return nil
     }
     
     /// Extract model code from device name (e.g., "PL105_XXXX" -> "PL105")
@@ -731,6 +840,10 @@ extension ZhiyunGATTController: CBCentralManagerDelegate {
     nonisolated func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
         Task { @MainActor in
             self.log("Connected to \(peripheral.name ?? "Unknown")")
+            self.connectingDeviceIds.remove(peripheral.identifier)
+            
+            let profile = self.resolveProfile(for: peripheral) ?? .zhiyunLight
+            self.deviceProfiles[peripheral.identifier] = profile
             
             // Add to connected devices list
             if !self.connectedDevices.contains(where: { $0.identifier == peripheral.identifier }) {
@@ -741,16 +854,24 @@ extension ZhiyunGATTController: CBCentralManagerDelegate {
             var state = ZhiyunDeviceState()
             if let name = peripheral.name {
                 state.deviceName = name
-                if let modelCode = self.extractModelCode(from: name) {
-                    state.modelCode = modelCode
-                    state.modelName = self.modelNames[modelCode] ?? "Unknown Model"
-                    self.log("Device model: \(modelCode) (\(state.modelName))")
+                switch profile {
+                case .zhiyunLight:
+                    if let modelCode = self.extractModelCode(from: name) {
+                        state.modelCode = modelCode
+                        state.modelName = self.modelNames[modelCode] ?? "Unknown Model"
+                        self.log("Device model: \(modelCode) (\(state.modelName))")
+                    }
+                case .oppleLightMaster:
+                    let model = self.oppleController.modelInfo(from: name)
+                    state.modelCode = model.code
+                    state.modelName = model.name
+                    self.log("Device model: \(model.code) (\(model.name))")
                 }
             }
             self.deviceStates[peripheral.identifier] = state
             
-            // Select this device if none selected
-            if self.selectedDeviceId == nil {
+            // Select first light device for control.
+            if self.selectedDeviceId == nil && profile == .zhiyunLight {
                 self.selectedDeviceId = peripheral.identifier
             }
             
@@ -759,13 +880,19 @@ extension ZhiyunGATTController: CBCentralManagerDelegate {
             // Save as known device for auto-reconnect
             self.saveKnownDevice(peripheral)
             
-            // Discover services
-            peripheral.discoverServices([ZhiyunProtocol.serviceUUID])
+            // Discover profile-specific services
+            switch profile {
+            case .zhiyunLight:
+                peripheral.discoverServices([ZhiyunProtocol.serviceUUID])
+            case .oppleLightMaster:
+                self.oppleController.handleConnectedPeripheral(peripheral)
+            }
         }
     }
     
     nonisolated func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
         Task { @MainActor in
+            self.connectingDeviceIds.remove(peripheral.identifier)
             self.log("Failed to connect to \(peripheral.name ?? "Unknown"): \(error?.localizedDescription ?? "Unknown error")")
             self.lastError = error?.localizedDescription
         }
@@ -773,9 +900,14 @@ extension ZhiyunGATTController: CBCentralManagerDelegate {
     
     nonisolated func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
         Task { @MainActor in
-            self.log("Disconnected from \(peripheral.name ?? "Unknown")")
+            if let error {
+                self.log("Disconnected from \(peripheral.name ?? "Unknown") (\(error.localizedDescription))")
+            } else {
+                self.log("Disconnected from \(peripheral.name ?? "Unknown")")
+            }
             
             let deviceId = peripheral.identifier
+            self.connectingDeviceIds.remove(deviceId)
             
             // Remove from connected devices
             self.connectedDevices.removeAll { $0.identifier == deviceId }
@@ -785,19 +917,21 @@ extension ZhiyunGATTController: CBCentralManagerDelegate {
             self.writeCharacteristics.removeValue(forKey: deviceId)
             self.notifyCharacteristics.removeValue(forKey: deviceId)
             self.sequenceNumbers.removeValue(forKey: deviceId)
+            self.deviceProfiles.removeValue(forKey: deviceId)
             self.pendingBrightness.removeValue(forKey: deviceId)
             self.pendingColorTemp.removeValue(forKey: deviceId)
             self.brightnessDebounceTask[deviceId]?.cancel()
             self.brightnessDebounceTask.removeValue(forKey: deviceId)
             self.colorTempDebounceTask[deviceId]?.cancel()
             self.colorTempDebounceTask.removeValue(forKey: deviceId)
+            self.oppleController.handleDisconnectedPeripheral(peripheral)
             
             // Update selected device if this was selected
             if self.selectedDeviceId == deviceId {
-                self.selectedDeviceId = self.connectedDevices.first?.identifier
+                self.selectedDeviceId = self.connectedLightDevices.first?.identifier
             }
             
-            if let error = error {
+            if let error {
                 self.lastError = error.localizedDescription
             }
         }
@@ -805,9 +939,13 @@ extension ZhiyunGATTController: CBCentralManagerDelegate {
 }
 
 // MARK: - CBPeripheralDelegate
-extension ZhiyunGATTController: CBPeripheralDelegate {
+extension BluetoothDeviceManager: CBPeripheralDelegate {
     nonisolated func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
         Task { @MainActor in
+            if self.oppleController.handleDidDiscoverServices(peripheral: peripheral, error: error) {
+                return
+            }
+            
             if let error = error {
                 self.log("[\(peripheral.name ?? "?")] Error discovering services: \(error.localizedDescription)")
                 return
@@ -832,6 +970,10 @@ extension ZhiyunGATTController: CBPeripheralDelegate {
     
     nonisolated func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
         Task { @MainActor in
+            if self.oppleController.handleDidDiscoverCharacteristics(peripheral: peripheral, service: service, error: error) {
+                return
+            }
+            
             let deviceId = peripheral.identifier
             
             if let error = error {
@@ -857,7 +999,7 @@ extension ZhiyunGATTController: CBPeripheralDelegate {
                 }
             }
             
-            // Initialize device once ready
+            // Initialize Zhiyun lights once ready.
             if self.writeCharacteristics[deviceId] != nil && self.notifyCharacteristics[deviceId] != nil {
                 self.log("[\(peripheral.name ?? "?")] Ready! Initializing...")
                 let peripheralId = peripheral.identifier
@@ -929,6 +1071,10 @@ extension ZhiyunGATTController: CBPeripheralDelegate {
     
     nonisolated func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
         Task { @MainActor in
+            if self.oppleController.handleDidUpdateValue(peripheral: peripheral, characteristic: characteristic, error: error) {
+                return
+            }
+            
             if let error = error {
                 self.log("[\(peripheral.name ?? "?")] Error receiving: \(error.localizedDescription)")
                 return
@@ -941,6 +1087,10 @@ extension ZhiyunGATTController: CBPeripheralDelegate {
     
     nonisolated func peripheral(_ peripheral: CBPeripheral, didWriteValueFor characteristic: CBCharacteristic, error: Error?) {
         Task { @MainActor in
+            if self.oppleController.handleDidWriteValue(peripheral: peripheral, characteristic: characteristic, error: error) {
+                return
+            }
+            
             if let error = error {
                 self.log("[\(peripheral.name ?? "?")] Error writing: \(error.localizedDescription)")
             }
@@ -949,18 +1099,15 @@ extension ZhiyunGATTController: CBPeripheralDelegate {
     
     nonisolated func peripheral(_ peripheral: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic, error: Error?) {
         Task { @MainActor in
+            if self.oppleController.handleDidUpdateNotificationState(peripheral: peripheral, characteristic: characteristic, error: error) {
+                return
+            }
+            
             if let error = error {
                 self.log("[\(peripheral.name ?? "?")] Notification error: \(error.localizedDescription)")
             } else {
                 self.log("[\(peripheral.name ?? "?")] Notifications enabled")
             }
         }
-    }
-}
-
-// MARK: - Data Extension
-extension Data {
-    var hexString: String {
-        return map { String(format: "%02X ", $0) }.joined().trimmingCharacters(in: .whitespaces)
     }
 }

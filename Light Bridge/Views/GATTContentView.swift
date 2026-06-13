@@ -99,16 +99,524 @@ private let colorTempGradient = LinearGradient(
     endPoint: .trailing
 )
 
+private struct MeterMetricTileView: View {
+    let title: String
+    let value: String
+    let unit: String
+    let accent: Color
+    let tileHeight: CGFloat
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title)
+                .font(.caption)
+                .foregroundColor(.secondary)
+            HStack(alignment: .firstTextBaseline, spacing: 3) {
+                Text(value)
+                    .font(.title2.weight(.semibold))
+                    .foregroundColor(.primary)
+                if !unit.isEmpty {
+                    Text(unit)
+                        .font(.caption.weight(.medium))
+                        .foregroundColor(.secondary)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, minHeight: tileHeight, maxHeight: tileHeight, alignment: .leading)
+        .padding(10)
+        .background(accent.opacity(0.12))
+        .cornerRadius(10)
+    }
+}
+
+private struct MeterTintTileView: View {
+    let duv: Double?
+    let tileHeight: CGFloat
+
+    private var tintRange: ClosedRange<Double> { -0.08...0.08 }
+    private var tintText: String { duv.map { String(format: "%.4f", $0) } ?? "--" }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text("Tint")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                Spacer()
+                Text("\(tintText) Duv")
+                    .font(.caption2.weight(.medium))
+                    .foregroundColor(.secondary)
+                    .monospacedDigit()
+            }
+
+            GeometryReader { geometry in
+                let normalized = {
+                    guard let duv else { return 0.5 }
+                    let clamped = min(max(duv, tintRange.lowerBound), tintRange.upperBound)
+                    return (clamped - tintRange.lowerBound) / (tintRange.upperBound - tintRange.lowerBound)
+                }()
+                let indicatorSize: CGFloat = 10
+                let markerX = max(0, min(geometry.size.width - indicatorSize, (geometry.size.width * normalized) - (indicatorSize / 2)))
+
+                ZStack(alignment: .leading) {
+                    RoundedRectangle(cornerRadius: 8)
+                        .fill(
+                            LinearGradient(
+                                colors: [
+                                    Color(red: 0.85, green: 0.74, blue: 0.82),
+                                    Color(red: 0.96, green: 0.90, blue: 0.94),
+                                    Color(red: 0.92, green: 0.95, blue: 0.92),
+                                    Color(red: 0.77, green: 0.88, blue: 0.78)
+                                ],
+                                startPoint: .leading,
+                                endPoint: .trailing
+                            )
+                        )
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(Color.primary.opacity(0.08), lineWidth: 1)
+
+                    Circle()
+                        .fill(Color.white)
+                        .frame(width: indicatorSize, height: indicatorSize)
+                        .overlay(Circle().stroke(Color.black.opacity(0.2), lineWidth: 0.8))
+                        .shadow(color: .black.opacity(0.12), radius: 1, x: 0, y: 0.5)
+                        .offset(x: markerX)
+                }
+            }
+            .frame(height: 12)
+        }
+        .frame(maxWidth: .infinity, minHeight: tileHeight, maxHeight: tileHeight, alignment: .leading)
+        .padding(10)
+        .background(Color(.systemGray5))
+        .cornerRadius(10)
+    }
+}
+
+private enum ExposureManualField: String {
+    case shutter = "Shutter"
+    case aperture = "Aperture"
+    case iso = "ISO"
+}
+
+private struct MeterExposureCalculatorView: View {
+    let ev100: Double?
+
+    @State private var aperture: Double = 2.8
+    @State private var shutter: Double = 1.0 / 50.0
+    @State private var iso: Double = 100.0
+    @State private var manualField: ExposureManualField = .aperture
+    @State private var pinnedFields: [ExposureManualField] = [.aperture]
+    @State private var didInitialize = false
+    private let tileHeight: CGFloat = 72
+
+    private static let apertureValues: [Double] = [
+        1.0, 1.1, 1.2, 1.4, 1.6, 1.8, 2.0, 2.2, 2.5, 2.8,
+        3.2, 3.5, 4.0, 4.5, 5.0, 5.6, 6.3, 7.1, 8.0, 9.0,
+        10.0, 11.0, 13.0, 14.0, 16.0, 18.0, 20.0, 22.0
+    ]
+
+    private static let shutterValues: [Double] = [
+        1.0 / 8000.0, 1.0 / 6400.0, 1.0 / 5000.0, 1.0 / 4000.0, 1.0 / 3200.0,
+        1.0 / 2500.0, 1.0 / 2000.0, 1.0 / 1600.0, 1.0 / 1250.0, 1.0 / 1000.0,
+        1.0 / 800.0, 1.0 / 640.0, 1.0 / 500.0, 1.0 / 400.0, 1.0 / 320.0,
+        1.0 / 250.0, 1.0 / 200.0, 1.0 / 160.0, 1.0 / 125.0, 1.0 / 100.0,
+        1.0 / 80.0, 1.0 / 60.0, 1.0 / 50.0, 1.0 / 40.0, 1.0 / 30.0,
+        1.0 / 25.0, 1.0 / 20.0, 1.0 / 15.0, 1.0 / 13.0, 1.0 / 10.0,
+        1.0 / 8.0, 1.0 / 6.0, 1.0 / 5.0, 1.0 / 4.0, 0.3, 0.4, 0.5,
+        0.6, 0.8, 1.0, 1.3, 1.6, 2.0, 2.5, 3.2, 4.0, 5.0,
+        6.0, 8.0, 10.0, 13.0, 15.0, 20.0, 25.0, 30.0
+    ]
+
+    private static let isoValues: [Double] = [
+        100, 125, 160, 200, 250, 320, 400, 500, 640, 800,
+        1000, 1250, 1600, 2000, 2500, 3200, 4000, 5000, 6400
+    ]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 4) {
+                        Text("Shutter")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                        Spacer(minLength: 4)
+                        Button {
+                            togglePin(.shutter)
+                        } label: {
+                            Image(systemName: isPinned(.shutter) ? "pin.fill" : "pin")
+                                .font(.caption2)
+                                .foregroundColor(isPinned(.shutter) ? .blue : .secondary)
+                        }
+                        .buttonStyle(.plain)
+                    }
+
+                    Menu {
+                        ForEach(Array(Self.shutterValues.enumerated()), id: \.offset) { index, value in
+                            Button(Self.shutterText(value)) {
+                                selectShutter(index)
+                            }
+                        }
+                    } label: {
+                        HStack(spacing: 4) {
+                            Text(Self.shutterText(shutter))
+                                .font(.title2.weight(.semibold))
+                                .foregroundColor(.primary)
+                                .monospacedDigit()
+                                .lineLimit(1)
+                                .minimumScaleFactor(0.72)
+                            Spacer(minLength: 4)
+                            Image(systemName: "chevron.down")
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(ev100 == nil)
+                }
+                .frame(maxWidth: .infinity, minHeight: tileHeight, maxHeight: tileHeight, alignment: .leading)
+                .padding(10)
+                .background(Color.blue.opacity(isPinned(.shutter) ? 0.16 : 0.08))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10)
+                        .stroke(isPinned(.shutter) ? Color.blue.opacity(0.45) : Color.clear, lineWidth: 1)
+                )
+                .cornerRadius(10)
+                
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 4) {
+                        Text("Aperture")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                        Spacer(minLength: 4)
+                        Button {
+                            togglePin(.aperture)
+                        } label: {
+                            Image(systemName: isPinned(.aperture) ? "pin.fill" : "pin")
+                                .font(.caption2)
+                                .foregroundColor(isPinned(.aperture) ? .orange : .secondary)
+                        }
+                        .buttonStyle(.plain)
+                    }
+
+                    Menu {
+                        ForEach(Array(Self.apertureValues.enumerated()), id: \.offset) { index, value in
+                            Button(Self.apertureText(value)) {
+                                selectAperture(index)
+                            }
+                        }
+                    } label: {
+                        HStack(spacing: 4) {
+                            Text(Self.apertureText(aperture))
+                                .font(.title2.weight(.semibold))
+                                .foregroundColor(.primary)
+                                .monospacedDigit()
+                                .lineLimit(1)
+                                .minimumScaleFactor(0.72)
+                            Spacer(minLength: 4)
+                            Image(systemName: "chevron.down")
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(ev100 == nil)
+                }
+                .frame(maxWidth: .infinity, minHeight: tileHeight, maxHeight: tileHeight, alignment: .leading)
+                .padding(10)
+                .background(Color.orange.opacity(isPinned(.aperture) ? 0.16 : 0.08))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10)
+                        .stroke(isPinned(.aperture) ? Color.orange.opacity(0.45) : Color.clear, lineWidth: 1)
+                )
+                .cornerRadius(10)
+
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 4) {
+                        Text("ISO")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                        Spacer(minLength: 4)
+                        Button {
+                            togglePin(.iso)
+                        } label: {
+                            Image(systemName: isPinned(.iso) ? "pin.fill" : "pin")
+                                .font(.caption2)
+                                .foregroundColor(isPinned(.iso) ? .green : .secondary)
+                        }
+                        .buttonStyle(.plain)
+                    }
+
+                    Menu {
+                        ForEach(Array(Self.isoValues.enumerated()), id: \.offset) { index, value in
+                            Button("ISO \(Int(value))") {
+                                selectISO(index)
+                            }
+                        }
+                    } label: {
+                        HStack(spacing: 4) {
+                            Text("\(Int(iso.rounded()))")
+                                .font(.title2.weight(.semibold))
+                                .foregroundColor(.primary)
+                                .monospacedDigit()
+                                .lineLimit(1)
+                                .minimumScaleFactor(0.72)
+                            Spacer(minLength: 4)
+                            Image(systemName: "chevron.down")
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(ev100 == nil)
+                }
+                .frame(maxWidth: .infinity, minHeight: tileHeight, maxHeight: tileHeight, alignment: .leading)
+                .padding(10)
+                .background(Color.green.opacity(isPinned(.iso) ? 0.16 : 0.08))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10)
+                        .stroke(isPinned(.iso) ? Color.green.opacity(0.45) : Color.clear, lineWidth: 1)
+                )
+                .cornerRadius(10)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            if ev100 == nil {
+                Text("Waiting for EV value from meter...")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+            }
+        }
+        .onAppear {
+            guard !didInitialize else { return }
+            didInitialize = true
+            recalculate()
+        }
+        .onChange(of: ev100) { _, _ in
+            recalculate()
+        }
+    }
+
+    private func isPinned(_ field: ExposureManualField) -> Bool {
+        pinnedFields.contains(field)
+    }
+
+    private var effectiveFixedFields: [ExposureManualField] {
+        if pinnedFields.isEmpty {
+            return [manualField]
+        }
+        return Array(pinnedFields.prefix(2))
+    }
+
+    private func togglePin(_ field: ExposureManualField) {
+        if let index = pinnedFields.firstIndex(of: field) {
+            pinnedFields.remove(at: index)
+        } else {
+            pinAsMostRecent(field)
+        }
+        recalculate(previous: (aperture, shutter, iso))
+    }
+
+    private func selectAperture(_ index: Int) {
+        let old = (aperture, shutter, iso)
+        aperture = Self.apertureValues[index]
+        manualField = .aperture
+        pinAsMostRecent(.aperture)
+        recalculate(previous: old)
+    }
+
+    private func selectShutter(_ index: Int) {
+        let old = (aperture, shutter, iso)
+        shutter = Self.shutterValues[index]
+        manualField = .shutter
+        pinAsMostRecent(.shutter)
+        recalculate(previous: old)
+    }
+
+    private func selectISO(_ index: Int) {
+        let old = (aperture, shutter, iso)
+        iso = Self.isoValues[index]
+        manualField = .iso
+        pinAsMostRecent(.iso)
+        recalculate(previous: old)
+    }
+
+    private func pinAsMostRecent(_ field: ExposureManualField) {
+        if let existingIndex = pinnedFields.firstIndex(of: field) {
+            pinnedFields.remove(at: existingIndex)
+        }
+        pinnedFields.append(field)
+        if pinnedFields.count > 2 {
+            pinnedFields.removeFirst()
+        }
+    }
+
+    private func recalculate(previous: (Double, Double, Double)? = nil) {
+        guard let ev100 else { return }
+
+        let fixedFields = effectiveFixedFields
+
+        if fixedFields.count >= 2 {
+            let fixed = Set(fixedFields.prefix(2))
+
+            if fixed.contains(.aperture) && fixed.contains(.iso) {
+                let exactShutter = Self.shutterFrom(ev100: ev100, aperture: aperture, iso: iso)
+                shutter = Self.closestValue(to: exactShutter, in: Self.shutterValues)
+                return
+            }
+
+            if fixed.contains(.shutter) && fixed.contains(.iso) {
+                let exactAperture = Self.apertureFrom(ev100: ev100, shutter: shutter, iso: iso)
+                aperture = Self.closestValue(to: exactAperture, in: Self.apertureValues)
+                return
+            }
+
+            if fixed.contains(.aperture) && fixed.contains(.shutter) {
+                let exactISO = 100.0 * (aperture * aperture) / (shutter * pow(2.0, ev100))
+                iso = Self.closestValue(to: exactISO, in: Self.isoValues)
+                return
+            }
+        }
+
+        let manual = fixedFields.first ?? manualField
+        let oldAperture = previous?.0 ?? aperture
+        let oldShutter = previous?.1 ?? shutter
+        let oldISO = previous?.2 ?? iso
+
+        var x0 = Self.x(aperture: oldAperture)
+        var y0 = Self.y(shutter: oldShutter)
+        var z0 = Self.z(iso: oldISO)
+
+        var x = x0
+        var y = y0
+        var z = z0
+
+        switch manual {
+        case .aperture:
+            x = Self.x(aperture: aperture)
+            let c = ev100 - x // y - z = c
+            y = (y0 + z0 + c) / 2.0
+            z = (y0 + z0 - c) / 2.0
+
+            iso = Self.closestValue(to: Self.iso(from: z), in: Self.isoValues)
+            let exactShutter = Self.shutterFrom(ev100: ev100, aperture: aperture, iso: iso)
+            shutter = Self.closestValue(to: exactShutter, in: Self.shutterValues)
+
+        case .shutter:
+            y = Self.y(shutter: shutter)
+            let c = ev100 - y // x - z = c
+            x = (x0 + z0 + c) / 2.0
+            z = (x0 + z0 - c) / 2.0
+
+            iso = Self.closestValue(to: Self.iso(from: z), in: Self.isoValues)
+            let exactAperture = Self.apertureFrom(ev100: ev100, shutter: shutter, iso: iso)
+            aperture = Self.closestValue(to: exactAperture, in: Self.apertureValues)
+
+        case .iso:
+            z = Self.z(iso: iso)
+            let c = ev100 + z // x + y = c
+            x = (c + x0 - y0) / 2.0
+            y = c - x
+
+            aperture = Self.closestValue(to: Self.aperture(from: x), in: Self.apertureValues)
+            let exactShutter = Self.shutterFrom(ev100: ev100, aperture: aperture, iso: iso)
+            shutter = Self.closestValue(to: exactShutter, in: Self.shutterValues)
+        }
+    }
+
+    private static func closestValue(to value: Double, in values: [Double]) -> Double {
+        values.min { abs($0 - value) < abs($1 - value) } ?? values[0]
+    }
+
+    private static func x(aperture: Double) -> Double {
+        log2(aperture * aperture)
+    }
+
+    private static func y(shutter: Double) -> Double {
+        -log2(shutter)
+    }
+
+    private static func z(iso: Double) -> Double {
+        log2(iso / 100.0)
+    }
+
+    private static func aperture(from x: Double) -> Double {
+        pow(2.0, x / 2.0)
+    }
+
+    private static func iso(from z: Double) -> Double {
+        100.0 * pow(2.0, z)
+    }
+
+    private static func shutterFrom(ev100: Double, aperture: Double, iso: Double) -> Double {
+        let exposureAtISO = ev100 + log2(iso / 100.0)
+        return (aperture * aperture) / pow(2.0, exposureAtISO)
+    }
+
+    private static func apertureFrom(ev100: Double, shutter: Double, iso: Double) -> Double {
+        let exposureAtISO = ev100 + log2(iso / 100.0)
+        return sqrt(shutter * pow(2.0, exposureAtISO))
+    }
+
+    private static func shutterText(_ value: Double) -> String {
+        if value >= 1.0 {
+            if abs(value.rounded() - value) < 0.05 {
+                return "\(Int(value.rounded()))s"
+            }
+            return String(format: "%.1fs", value)
+        }
+
+        let denominator = Int((1.0 / value).rounded())
+        return "1/\(denominator)s"
+    }
+
+    private static func apertureText(_ value: Double) -> String {
+        if abs(value.rounded() - value) < 0.05 {
+            return "f/\(Int(value.rounded()))"
+        }
+        return String(format: "f/%.1f", value)
+    }
+}
+
 // MARK: - GATT Content View
 struct GATTContentView: View {
-    @StateObject private var controller = ZhiyunGATTController()
+    @ObservedObject private var controller: BluetoothDeviceManager
     @State private var showDeviceList = false
     @State private var controlMode: ControlMode = .individual
+    private let meterTileHeight: CGFloat = 72
+    
+    init(controller: BluetoothDeviceManager) {
+        self.controller = controller
+    }
     
     enum ControlMode {
         case individual
         case all
         case combined
+    }
+    
+    private var connectedLightDevices: [CBPeripheral] {
+        controller.connectedLightDevices
+    }
+    
+    private var connectedMeterDevices: [CBPeripheral] {
+        controller.connectedMeterDevices
+    }
+    
+    private func iconForDevice(_ peripheral: CBPeripheral) -> (name: String, color: Color) {
+        if controller.profile(for: peripheral) == .oppleLightMaster {
+            return ("gauge.with.dots.needle.50percent", .blue)
+        }
+        return ("lightbulb.fill", .yellow)
+    }
+    
+    private func deviceTypeLabel(_ peripheral: CBPeripheral) -> String {
+        switch controller.profile(for: peripheral) {
+        case .zhiyunLight:
+            return "Light"
+        case .oppleLightMaster:
+            return "Meter"
+        }
     }
     
     var body: some View {
@@ -160,7 +668,7 @@ struct GATTContentView: View {
     private var statusText: String {
         let connectedCount = controller.connectedDevices.count
         if connectedCount > 0 {
-            return "\(connectedCount) light(s) connected"
+            return "\(connectedCount) device(s) connected"
         } else if !controller.discoveredDevices.isEmpty && controller.isScanning {
             return "Found \(controller.discoveredDevices.count) device(s)..."
         } else if controller.isScanning {
@@ -181,21 +689,21 @@ struct GATTContentView: View {
                         .scaleEffect(1.5)
                     
                     if controller.discoveredDevices.isEmpty {
-                        Text("Searching for lights...")
+                        Text("Searching for devices...")
                             .font(.headline)
                             .foregroundColor(.secondary)
                     } else {
-                        Text("Found \(controller.discoveredDevices.count) light(s)...")
+                        Text("Found \(controller.discoveredDevices.count) device(s)...")
                             .font(.headline)
                             .foregroundColor(.secondary)
                     }
                 }
             } else {
                 VStack(spacing: 16) {
-                    Image(systemName: "lightbulb")
+                    Image(systemName: "dot.radiowaves.left.and.right")
                         .font(.system(size: 64))
                         .foregroundColor(.gray)
-                    Text("No lights found")
+                    Text("No devices found")
                         .font(.headline)
                         .foregroundColor(.gray)
                 }
@@ -244,15 +752,16 @@ struct GATTContentView: View {
                 if !controller.connectedDevices.isEmpty {
                     Section("Connected") {
                         ForEach(controller.connectedDevices, id: \.identifier) { peripheral in
+                            let icon = iconForDevice(peripheral)
                             HStack {
-                                Image(systemName: "lightbulb.fill")
-                                    .foregroundColor(.green)
+                                Image(systemName: icon.name)
+                                    .foregroundColor(icon.color)
                                 VStack(alignment: .leading) {
                                     Text(controller.state(for: peripheral).modelName.isEmpty ?
                                          (peripheral.name ?? "Unknown") :
                                          controller.state(for: peripheral).modelName)
                                         .font(.headline)
-                                    Text(peripheral.name ?? "")
+                                    Text("\(deviceTypeLabel(peripheral)) • \(peripheral.name ?? "")")
                                         .font(.caption2)
                                         .foregroundColor(.secondary)
                                 }
@@ -274,16 +783,17 @@ struct GATTContentView: View {
                 if !availableDevices.isEmpty {
                     Section("Available") {
                         ForEach(availableDevices, id: \.identifier) { peripheral in
+                            let icon = iconForDevice(peripheral)
                             Button(action: {
                                 controller.connect(to: peripheral)
                             }) {
                                 HStack {
-                                    Image(systemName: "lightbulb")
-                                        .foregroundColor(.yellow)
+                                    Image(systemName: icon.name)
+                                        .foregroundColor(icon.color)
                                     VStack(alignment: .leading) {
                                         Text(peripheral.name ?? "Unknown Device")
                                             .font(.headline)
-                                        Text(peripheral.identifier.uuidString)
+                                        Text("\(deviceTypeLabel(peripheral)) • \(peripheral.identifier.uuidString)")
                                             .font(.caption2)
                                             .foregroundColor(.secondary)
                                     }
@@ -310,20 +820,27 @@ struct GATTContentView: View {
     
     // MARK: - Connected Devices View
     private var connectedDevicesView: some View {
-        VStack(spacing: 0) {
-            Picker("Control Mode", selection: $controlMode) {
-                Text("Individual").tag(ControlMode.individual)
-                Text("All Lights").tag(ControlMode.all)
-                Text("Combined").tag(ControlMode.combined)
+        let allDevices = controller.connectedDevices
+        let lightDevices = connectedLightDevices
+        let meterDevices = connectedMeterDevices
+        let hasLights = !lightDevices.isEmpty
+        
+        return VStack(spacing: 0) {
+            if hasLights {
+                Picker("Control Mode", selection: $controlMode) {
+                    Text("Individual").tag(ControlMode.individual)
+                    Text("All Lights").tag(ControlMode.all)
+                    Text("Combined").tag(ControlMode.combined)
+                }
+                .pickerStyle(.segmented)
+                .padding()
             }
-            .pickerStyle(.segmented)
-            .padding()
-            
-            if controlMode == .individual {
-                if controller.connectedDevices.count > 1 {
+
+            if controlMode == .individual || !hasLights {
+                if allDevices.count > 1 {
                     ScrollView(.horizontal, showsIndicators: false) {
                         HStack(spacing: 8) {
-                            ForEach(controller.connectedDevices, id: \.identifier) { peripheral in
+                            ForEach(allDevices, id: \.identifier) { peripheral in
                                 deviceTab(for: peripheral)
                             }
                         }
@@ -331,15 +848,15 @@ struct GATTContentView: View {
                     }
                     .padding(.bottom, 8)
                 }
-                
-                if let selectedId = controller.selectedDeviceId,
-                   let peripheral = controller.connectedDevices.first(where: { $0.identifier == selectedId }) {
-                    ScrollView {
-                        VStack(spacing: 16) {
-                            deviceInfoCard(for: peripheral)
-                            lightControlsCard(for: peripheral)
-                        }
-                        .padding(.top, 8)
+
+                ScrollView {
+                    if let selectedId = controller.selectedDeviceId,
+                       let selected = allDevices.first(where: { $0.identifier == selectedId }) {
+                        devicePanel(for: selected)
+                            .padding(.top, 8)
+                    } else if let firstDevice = allDevices.first {
+                        devicePanel(for: firstDevice)
+                            .padding(.top, 8)
                     }
                 }
             } else if controlMode == .all {
@@ -347,15 +864,21 @@ struct GATTContentView: View {
                     VStack(spacing: 16) {
                         allDevicesInfoCard
                         allLightsControlsCard
+                        if !meterDevices.isEmpty {
+                            meterDevicesCard(devices: meterDevices)
+                        }
                     }
                     .padding(.top, 8)
                 }
             } else {
-                // Combined mode - all devices with simplified controls on one page
+                // Combined mode - all lights with simplified controls on one page.
                 ScrollView {
                     VStack(spacing: 16) {
-                        ForEach(controller.connectedDevices, id: \.identifier) { peripheral in
+                        ForEach(lightDevices, id: \.identifier) { peripheral in
                             simplifiedLightControlsCard(for: peripheral)
+                        }
+                        if !meterDevices.isEmpty {
+                            meterDevicesCard(devices: meterDevices)
                         }
                     }
                     .padding(.top, 8)
@@ -397,19 +920,36 @@ struct GATTContentView: View {
             .padding(.bottom, 8)
         }
     }
+
+    private func devicePanel(for peripheral: CBPeripheral) -> some View {
+        let profile = controller.profile(for: peripheral)
+
+        return VStack(spacing: 16) {
+            deviceInfoCard(for: peripheral)
+            if profile == .oppleLightMaster {
+                meterDeviceCard(for: peripheral)
+                    .padding(.horizontal)
+            } else {
+                lightControlsCard(for: peripheral)
+            }
+        }
+    }
     
     // MARK: - Device Tab
     private func deviceTab(for peripheral: CBPeripheral) -> some View {
         let isSelected = controller.selectedDeviceId == peripheral.identifier
         let state = controller.state(for: peripheral)
+        let isMeter = controller.profile(for: peripheral) == .oppleLightMaster
+        let iconName = isMeter ? "gauge.with.dots.needle.50percent" : (state.isOn ? "lightbulb.fill" : "lightbulb")
+        let iconColor: Color = isMeter ? .blue : (state.isOn ? .yellow : .gray)
         
         return Button(action: {
             controller.selectDevice(peripheral)
         }) {
             VStack(spacing: 4) {
-                Image(systemName: state.isOn ? "lightbulb.fill" : "lightbulb")
+                Image(systemName: iconName)
                     .font(.title2)
-                    .foregroundColor(state.isOn ? .yellow : .gray)
+                    .foregroundColor(iconColor)
                 Text(state.modelName.isEmpty ? (peripheral.name ?? "?") : state.modelName)
                     .font(.caption2)
                     .lineLimit(1)
@@ -429,16 +969,19 @@ struct GATTContentView: View {
     // MARK: - Device Info Card
     private func deviceInfoCard(for peripheral: CBPeripheral) -> some View {
         let state = controller.state(for: peripheral)
+        let isMeter = controller.profile(for: peripheral) == .oppleLightMaster
         
         return VStack(alignment: .leading, spacing: 8) {
             Text("Device Info")
                 .font(.headline)
-            
-            HStack {
-                Label("Model", systemImage: "lightbulb.led.fill")
-                Spacer()
-                Text(state.modelName.isEmpty ? "..." : state.modelName)
-                    .foregroundColor(.secondary)
+
+            if !isMeter {
+                HStack {
+                    Label("Model", systemImage: "lightbulb.led.fill")
+                    Spacer()
+                    Text(state.modelName.isEmpty ? "..." : state.modelName)
+                        .foregroundColor(.secondary)
+                }
             }
             
             HStack {
@@ -449,19 +992,31 @@ struct GATTContentView: View {
                     .font(.caption)
             }
             
-            HStack {
-                Label("Firmware", systemImage: "cpu")
-                Spacer()
-                Text(state.firmwareVersion.isEmpty ? "..." : state.firmwareVersion)
-                    .foregroundColor(.secondary)
+            if !isMeter {
+                HStack {
+                    Label("Firmware", systemImage: "cpu")
+                    Spacer()
+                    Text(state.firmwareVersion.isEmpty ? "..." : state.firmwareVersion)
+                        .foregroundColor(.secondary)
+                }
             }
             
-            HStack {
-                Label("State", systemImage: "power")
-                Spacer()
-                Text(state.isOn ? "ON" : "OFF")
-                    .foregroundColor(state.isOn ? .green : .gray)
-                    .fontWeight(.bold)
+            if isMeter {
+                HStack {
+                    Label("Readings", systemImage: "waveform.path.ecg")
+                    Spacer()
+                    Text(state.meterCCT == nil ? "Waiting..." : "Live")
+                        .foregroundColor(state.meterCCT == nil ? .secondary : .green)
+                        .fontWeight(.bold)
+                }
+            } else {
+                HStack {
+                    Label("State", systemImage: "power")
+                    Spacer()
+                    Text(state.isOn ? "ON" : "OFF")
+                        .foregroundColor(state.isOn ? .green : .gray)
+                        .fontWeight(.bold)
+                }
             }
         }
         .padding()
@@ -479,11 +1034,11 @@ struct GATTContentView: View {
             HStack {
                 Label("Connected", systemImage: "lightbulb.2.fill")
                 Spacer()
-                Text("\(controller.connectedDevices.count) light(s)")
+                Text("\(connectedLightDevices.count) light(s)")
                     .foregroundColor(.secondary)
             }
             
-            ForEach(controller.connectedDevices, id: \.identifier) { peripheral in
+            ForEach(connectedLightDevices, id: \.identifier) { peripheral in
                 let state = controller.state(for: peripheral)
                 HStack {
                     Image(systemName: state.isOn ? "lightbulb.fill" : "lightbulb")
@@ -503,6 +1058,84 @@ struct GATTContentView: View {
         .padding(.horizontal)
     }
     
+    private func meterDevicesCard(devices: [CBPeripheral]) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            ForEach(devices, id: \.identifier) { peripheral in
+                meterDeviceCard(for: peripheral)
+            }
+        }
+        .padding(.horizontal)
+    }
+
+    private func meterDeviceCard(for peripheral: CBPeripheral) -> some View {
+        let state = controller.state(for: peripheral)
+
+        return VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Image(systemName: "gauge.with.dots.needle.50percent")
+                    .foregroundColor(.blue)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(state.modelName.isEmpty ?
+                         (peripheral.name ?? "Unknown Meter") :
+                         state.modelName)
+                        .font(.headline)
+                    Text(peripheral.name ?? peripheral.identifier.uuidString)
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                    if let profileName = state.meterMetricsProfileName {
+                        Text("Profile: \(profileName)\(state.meterMetricsProfileIsProvisional ? " (provisional)" : "")")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                    }
+                }
+                Spacer()
+            }
+
+            let wbText = state.meterCCT.map { "\(Int($0.rounded()))" } ?? "--"
+            let luxText = state.meterLux.map { "\(Int($0.rounded()))" } ?? "--"
+            let evText = state.meterEV100.map { String(format: "%.2f", $0) } ?? "--"
+            VStack(spacing: 8) {
+                HStack(spacing: 8) {
+                    MeterMetricTileView(
+                        title: "WB",
+                        value: wbText,
+                        unit: "K",
+                        accent: .orange,
+                        tileHeight: meterTileHeight
+                    )
+                    MeterMetricTileView(
+                        title: "Lux",
+                        value: luxText,
+                        unit: "",
+                        accent: .yellow,
+                        tileHeight: meterTileHeight
+                    )
+                }
+                HStack(spacing: 8) {
+                    MeterMetricTileView(
+                        title: "EV",
+                        value: evText,
+                        unit: "100",
+                        accent: .blue,
+                        tileHeight: meterTileHeight
+                    )
+                    MeterTintTileView(duv: state.meterDuv, tileHeight: meterTileHeight)
+                }
+            }
+
+            MeterExposureCalculatorView(ev100: state.meterEV100)
+
+            if state.meterCCT == nil || state.meterLux == nil || state.meterEV100 == nil {
+                Text("Waiting for measurement data...")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+            }
+        }
+        .padding()
+        .background(Color(.systemGray6))
+        .cornerRadius(12)
+    }
+
     // MARK: - Light Controls Card
     private func lightControlsCard(for peripheral: CBPeripheral) -> some View {
         let deviceId = peripheral.identifier
@@ -652,9 +1285,9 @@ struct GATTContentView: View {
     
     // MARK: - All Lights Controls Card
     private var allLightsControlsCard: some View {
-        let count = controller.connectedDevices.count
-        let totalBrightness = controller.connectedDevices.reduce(0.0) { $0 + Double(controller.state(for: $1).brightness) }
-        let totalColorTemp = controller.connectedDevices.reduce(0.0) { $0 + Double(controller.state(for: $1).colorTemperature) }
+        let count = connectedLightDevices.count
+        let totalBrightness = connectedLightDevices.reduce(0.0) { $0 + Double(controller.state(for: $1).brightness) }
+        let totalColorTemp = connectedLightDevices.reduce(0.0) { $0 + Double(controller.state(for: $1).colorTemperature) }
         let averageBrightness: Int = count == 0 ? 0 : Int(totalBrightness / Double(count))
         let averageColorTemp: Int = count == 0 ? 0 : Int(totalColorTemp / Double(count))
         
@@ -697,9 +1330,9 @@ struct GATTContentView: View {
                 VerticalBarSlider(
                     value: Binding(
                         get: {
-                            let count: Double = Double(controller.connectedDevices.count)
+                            let count: Double = Double(connectedLightDevices.count)
                             if count == 0 { return 0.0 }
-                            let total: Double = controller.connectedDevices.reduce(0.0) { partial, p in
+                            let total: Double = connectedLightDevices.reduce(0.0) { partial, p in
                                 partial + Double(controller.state(for: p).brightness)
                             }
                             return total / count
@@ -726,9 +1359,9 @@ struct GATTContentView: View {
                 VerticalBarSlider(
                     value: Binding(
                         get: {
-                            let count: Double = Double(controller.connectedDevices.count)
+                            let count: Double = Double(connectedLightDevices.count)
                             if count == 0 { return 0.0 }
-                            let total: Double = controller.connectedDevices.reduce(0.0) { partial, p in
+                            let total: Double = connectedLightDevices.reduce(0.0) { partial, p in
                                 partial + Double(controller.state(for: p).colorTemperature)
                             }
                             return total / count
@@ -822,9 +1455,10 @@ struct GATTContentView: View {
 }
 
 // MARK: - Mock Controller for Previews
-class MockZhiyunGATTController: ZhiyunGATTController {
+class MockBluetoothDeviceManager: BluetoothDeviceManager {
     override init() {
         super.init()
+        // Setup mock state
     }
 }
 
@@ -1031,7 +1665,7 @@ struct PreviewScanningView: View {
                 ProgressView()
                     .scaleEffect(1.5)
                 
-                Text("Found 2 light(s)...")
+                Text("Found 2 device(s)...")
                     .font(.headline)
                     .foregroundColor(.secondary)
             }
@@ -1073,7 +1707,7 @@ struct PreviewConnectionStatusView: View {
                 .fill(isConnected ? Color.green : Color.orange)
                 .frame(width: 12, height: 12)
             
-            Text(isConnected ? "\(count) light(s) connected" : "Scanning...")
+            Text(isConnected ? "\(count) device(s) connected" : "Scanning...")
                 .font(.caption)
                 .foregroundColor(.secondary)
             
@@ -1087,18 +1721,22 @@ struct PreviewConnectionStatusView: View {
 
 struct PreviewDeviceTabs: View {
     @State private var selectedIndex = 0
-    let devices = ["MOLUS X100", "MOLUS G60", "FIVERAY M20C"]
+    let devices: [(name: String, icon: String, color: Color)] = [
+        ("MOLUS X100", "lightbulb.fill", .yellow),
+        ("SigMesh", "gauge.with.dots.needle.50percent", .blue),
+        ("FIVERAY M20C", "lightbulb.fill", .yellow)
+    ]
     
     var body: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 8) {
-                ForEach(Array(devices.enumerated()), id: \.offset) { index, name in
+                ForEach(Array(devices.enumerated()), id: \.offset) { index, device in
                     Button(action: { selectedIndex = index }) {
                         VStack(spacing: 4) {
-                            Image(systemName: "lightbulb.fill")
+                            Image(systemName: device.icon)
                                 .font(.title2)
-                                .foregroundColor(.yellow)
-                            Text(name)
+                                .foregroundColor(device.color)
+                            Text(device.name)
                                 .font(.caption2)
                                 .lineLimit(1)
                         }
@@ -1119,10 +1757,52 @@ struct PreviewDeviceTabs: View {
     }
 }
 
+struct PreviewMeterTiles: View {
+    private let tileHeight: CGFloat = 72
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
+                MeterMetricTileView(
+                    title: "WB",
+                    value: "4320",
+                    unit: "K",
+                    accent: .orange,
+                    tileHeight: tileHeight
+                )
+                MeterMetricTileView(
+                    title: "Lux",
+                    value: "286",
+                    unit: "",
+                    accent: .yellow,
+                    tileHeight: tileHeight
+                )
+            }
+            HStack(spacing: 8) {
+                MeterMetricTileView(
+                    title: "EV",
+                    value: "6.83",
+                    unit: "100",
+                    accent: .blue,
+                    tileHeight: tileHeight
+                )
+                MeterTintTileView(
+                    duv: 0.0124,
+                    tileHeight: tileHeight
+                )
+            }
+        }
+        .padding()
+        .background(Color(.systemGray6))
+        .cornerRadius(12)
+        .padding(.horizontal)
+    }
+}
+
 // MARK: - Previews
 struct GATTContentView_Previews: PreviewProvider {
     static var previews: some View {
-        GATTContentView()
+        GATTContentView(controller: .shared)
             .previewDisplayName("Main View")
     }
 }
@@ -1145,6 +1825,24 @@ struct LightControlsCard_Previews: PreviewProvider {
     }
 }
 
+struct MeterTiles_Previews: PreviewProvider {
+    static var previews: some View {
+        PreviewMeterTiles()
+            .previewDisplayName("Meter Tiles")
+            .previewLayout(.sizeThatFits)
+            .padding(.vertical)
+    }
+}
+
+struct MeterExposureCalculator_Previews: PreviewProvider {
+    static var previews: some View {
+        MeterExposureCalculatorView(ev100: 6.83)
+            .padding()
+            .previewDisplayName("Meter Exposure Calculator")
+            .previewLayout(.sizeThatFits)
+    }
+}
+
 struct AllDevicesInfoCard_Previews: PreviewProvider {
     static var previews: some View {
         PreviewAllDevicesInfoCard()
@@ -1158,7 +1856,7 @@ struct ScanningView_Previews: PreviewProvider {
     static var previews: some View {
         NavigationView {
             PreviewScanningView()
-                .navigationTitle("Zhiyun Light Control")
+                .navigationTitle("Light Bridge")
                 .navigationBarTitleDisplayMode(.inline)
         }
         .previewDisplayName("Scanning View")
@@ -1213,6 +1911,39 @@ struct ConnectedView_Previews: PreviewProvider {
             .navigationBarTitleDisplayMode(.inline)
         }
         .previewDisplayName("Connected View - Individual")
+    }
+}
+
+struct ConnectedMeterView_Previews: PreviewProvider {
+    static var previews: some View {
+        NavigationView {
+            ScrollView {
+                VStack(spacing: 0) {
+                    PreviewConnectionStatusView(isConnected: true, count: 3)
+
+                    Picker("Control Mode", selection: .constant(0)) {
+                        Text("Individual").tag(0)
+                        Text("All Lights").tag(1)
+                        Text("Combined").tag(2)
+                    }
+                    .pickerStyle(.segmented)
+                    .padding()
+
+                    PreviewDeviceTabs()
+                        .padding(.bottom, 8)
+
+                    PreviewDeviceInfoCard()
+                    PreviewMeterTiles()
+                    MeterExposureCalculatorView(ev100: 6.83)
+                        .padding(.horizontal)
+
+                    Spacer()
+                }
+            }
+            .navigationTitle("Light Bridge")
+            .navigationBarTitleDisplayMode(.inline)
+        }
+        .previewDisplayName("Connected View - Meter")
     }
 }
 
@@ -1275,4 +2006,3 @@ struct CombinedMode_Previews: PreviewProvider {
         .previewDisplayName("Combined Mode")
     }
 }
-
